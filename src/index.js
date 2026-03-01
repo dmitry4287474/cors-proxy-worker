@@ -1,18 +1,28 @@
 /**
  * Cloudflare Workers CORS Proxy
  *
- * Usage (path-based):
- *   POST https://your-proxy.workers.dev/https://target-api.com/v1/endpoint?q=hello
- *   Headers:  X-API-Key: <your-key>
- *             Content-Type: application/json
- *   Body:     {"query": "hello"}
+ * Two modes:
  *
- * The worker validates the API key, forwards the request to the target,
- * strips the target's CORS headers, and returns the response with
- * proper CORS headers for Power BI Service / any browser origin.
+ *   SIMPLE MODE (env var API_KEYS):
+ *     All keys share the same rate limit and target whitelist.
+ *
+ *   ADVANCED MODE (KV namespace PROXY_KEYS):
+ *     Each key has its own config — allowed targets, rate limit, active flag.
+ *     KV value format per key:
+ *     {
+ *       "name": "Client Name",
+ *       "active": true,
+ *       "rateLimit": 60,
+ *       "allowedTargets": ["api.example.com", "api2.example.com"]
+ *     }
+ *
+ * Usage:
+ *   POST https://your-proxy.workers.dev/https://target-api.com/v1/endpoint
+ *   Headers:  X-API-Key: <key>
+ *             Content-Type: application/json
  */
 
-// ─── Rate limiter (per-isolate, resets on cold start) ────────────
+// ─── Rate limiter (per-isolate) ──────────────────────────────────
 const rateLimitStore = new Map();
 
 function checkRateLimit(apiKey, maxPerMinute) {
@@ -43,19 +53,13 @@ function corsHeaders(request) {
 }
 
 function handlePreflight(request) {
-    return new Response(null, {
-        status: 204,
-        headers: corsHeaders(request),
-    });
+    return new Response(null, { status: 204, headers: corsHeaders(request) });
 }
 
 function errorResponse(status, message, request) {
     return new Response(JSON.stringify({ error: message }), {
         status,
-        headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders(request),
-        },
+        headers: { "Content-Type": "application/json", ...corsHeaders(request) },
     });
 }
 
@@ -69,6 +73,75 @@ function extractTargetUrl(request) {
     return raw || null;
 }
 
+// ─── API key validation ──────────────────────────────────────────
+async function validateKey(apiKey, targetHost, env) {
+    // ── Advanced mode: KV with per-key config ──
+    if (env.PROXY_KEYS) {
+        const raw = await env.PROXY_KEYS.get(apiKey);
+        if (!raw) {
+            return { valid: false, error: "Invalid API key" };
+        }
+
+        let config;
+        try {
+            config = JSON.parse(raw);
+        } catch {
+            return { valid: false, error: "Corrupted key config" };
+        }
+
+        if (config.active === false) {
+            return { valid: false, error: "API key is deactivated" };
+        }
+
+        // Per-key target whitelist
+        if (config.allowedTargets && config.allowedTargets.length > 0) {
+            const targets = config.allowedTargets.map((d) => d.toLowerCase());
+            const host = targetHost.toLowerCase();
+            if (!targets.some((d) => host === d || host.endsWith("." + d))) {
+                return { valid: false, error: `Target '${targetHost}' is not allowed for this key` };
+            }
+        }
+
+        return {
+            valid: true,
+            rateLimit: config.rateLimit || 100,
+            name: config.name || "unknown",
+        };
+    }
+
+    // ── Simple mode: env var API_KEYS ──
+    const validKeys = (env.API_KEYS || "")
+        .split(",")
+        .map((k) => k.trim())
+        .filter(Boolean);
+
+    if (validKeys.length === 0) {
+        return { valid: false, error: "No API keys configured on proxy" };
+    }
+
+    if (!validKeys.includes(apiKey)) {
+        return { valid: false, error: "Invalid API key" };
+    }
+
+    // Global target whitelist (simple mode)
+    const allowedTargets = (env.ALLOWED_TARGETS || "")
+        .split(",")
+        .map((d) => d.trim().toLowerCase())
+        .filter(Boolean);
+
+    if (allowedTargets.length > 0) {
+        const host = targetHost.toLowerCase();
+        if (!allowedTargets.some((d) => host === d || host.endsWith("." + d))) {
+            return { valid: false, error: `Target '${targetHost}' is not allowed` };
+        }
+    }
+
+    return {
+        valid: true,
+        rateLimit: parseInt(env.RATE_LIMIT_PER_MINUTE || "100", 10),
+    };
+}
+
 // ─── Main handler ────────────────────────────────────────────────
 export default {
     async fetch(request, env) {
@@ -77,33 +150,13 @@ export default {
         }
 
         try {
-            // --- API key validation ---
+            // --- API key ---
             const apiKey = request.headers.get("X-API-Key");
-
             if (!apiKey) {
                 return errorResponse(403, "Missing X-API-Key header", request);
             }
 
-            const validKeys = (env.API_KEYS || "")
-                .split(",")
-                .map((k) => k.trim())
-                .filter(Boolean);
-
-            if (validKeys.length === 0) {
-                return errorResponse(500, "No API keys configured on proxy", request);
-            }
-
-            if (!validKeys.includes(apiKey)) {
-                return errorResponse(403, "Invalid API key", request);
-            }
-
-            // --- Rate limiting ---
-            const limit = parseInt(env.RATE_LIMIT_PER_MINUTE || "100", 10);
-            if (checkRateLimit(apiKey, limit)) {
-                return errorResponse(429, "Rate limit exceeded. Try again in 1 minute.", request);
-            }
-
-            // --- Extract target URL ---
+            // --- Target URL ---
             const targetUrl = extractTargetUrl(request);
 
             if (!targetUrl || (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://"))) {
@@ -114,20 +167,20 @@ export default {
                 );
             }
 
-            // --- Optional: target domain whitelist ---
-            const allowedTargets = (env.ALLOWED_TARGETS || "")
-                .split(",")
-                .map((d) => d.trim().toLowerCase())
-                .filter(Boolean);
+            const targetHost = new URL(targetUrl).hostname;
 
-            if (allowedTargets.length > 0) {
-                const targetHost = new URL(targetUrl).hostname.toLowerCase();
-                if (!allowedTargets.some((d) => targetHost === d || targetHost.endsWith("." + d))) {
-                    return errorResponse(403, `Target domain '${targetHost}' is not allowed`, request);
-                }
+            // --- Validate key + check target permissions ---
+            const auth = await validateKey(apiKey, targetHost, env);
+            if (!auth.valid) {
+                return errorResponse(403, auth.error, request);
             }
 
-            // --- Build forwarded request ---
+            // --- Rate limiting (per-key limit) ---
+            if (checkRateLimit(apiKey, auth.rateLimit)) {
+                return errorResponse(429, "Rate limit exceeded. Try again in 1 minute.", request);
+            }
+
+            // --- Forward request ---
             const forwardHeaders = new Headers();
             for (const [key, value] of request.headers) {
                 const lower = key.toLowerCase();

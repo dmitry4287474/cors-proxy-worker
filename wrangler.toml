@@ -2,6 +2,23 @@ name = "cors-proxy"
 main = "src/index.js"
 compatibility_date = "2024-09-01"
 
+# ── Simple mode (env vars) ──────────────────────────────
+# API_KEYS: set via "npx wrangler secret put API_KEYS"
+# Format: comma-separated keys
+
 [vars]
 RATE_LIMIT_PER_MINUTE = "100"
 ALLOWED_TARGETS = ""
+
+# ── Advanced mode (KV per-key config) ───────────────────
+# 1. Create KV:  npx wrangler kv namespace create PROXY_KEYS
+# 2. Paste the ID below and uncomment:
+#
+# [[kv_namespaces]]
+# binding = "PROXY_KEYS"
+# id = "paste-your-namespace-id-here"
+#
+# 3. Add keys:
+#    npx wrangler kv key put --namespace-id=<ID> "my-api-key-abc123" '{"name":"Client A","active":true,"rateLimit":60,"allowedTargets":["api.example.com"]}'
+#
+# When PROXY_KEYS is bound, it takes priority over API_KEYS env var.
