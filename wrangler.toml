@@ -1,0 +1,7 @@
+name = "cors-proxy"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[vars]
+RATE_LIMIT_PER_MINUTE = "100"
+ALLOWED_TARGETS = ""
